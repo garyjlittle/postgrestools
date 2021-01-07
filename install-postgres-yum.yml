@@ -1,0 +1,21 @@
+---
+#
+# At the remote site, the user will need to have NOPASSWD added to their
+# entry in the sudoers file.
+#
+- hosts: all
+  become: yes
+  tasks:
+    - name: Install Postgresql Server
+      yum:
+        name: postgresql-server
+        state: present
+    - name: Install Postgres Contrib
+      yum:
+          name: postgresql-contrib
+          state: present
+    - name: Copy clone script
+      copy:
+         src: ./create_pg.sh
+         dest: /var/lib/pgsql/
+         mode: '0777'
