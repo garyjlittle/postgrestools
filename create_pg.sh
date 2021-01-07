@@ -27,6 +27,14 @@ if [[ $(whoami) != $PGUSER ]] ; then
     #exit here
 fi
 
+
+echo Initializing postgresDB
+initdb
+
+#####
+# NEED to Start postgres here as root
+####
+
 echo Creating the DB $DB_NAME schema
 createdb $DB_NAME
 
