@@ -1,10 +1,8 @@
 ---
 #
-# At the remote site, the user will need to have NOPASSWD added to their
-# entry in the sudoers file.
-#
+# This will be expected to run as root.
+# The initdb task will fail if a DB already exists.
 - hosts: all
-  become: yes
   tasks:
     - name: Install Postgresql Server
       yum:
@@ -14,8 +12,16 @@
       yum:
           name: postgresql-contrib
           state: present
-    - name: Copy clone script
-      copy:
-         src: ./create_pg.sh
-         dest: /var/lib/pgsql/
-         mode: '0777'
+    - name: Start Postgres DB Engine
+      systemd: 
+        name: postgresql
+        enabled: yes
+        state: started
+    - name: Initialize DB
+      command: "initdb"
+      become: true
+      become_method: su
+      become_user: postgres
+      become_flags: '-l'
+
+
