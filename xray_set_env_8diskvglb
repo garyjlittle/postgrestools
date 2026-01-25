@@ -1,0 +1,11 @@
+export XRAY_SERVER=perf105-xray-hotfix
+#
+# Xray Postgres DB Workload
+export XRAY_DB_CLIENT=perf105-xray-postgres-client
+export XRAY_DB_SERVER=perf105-xray-postgres-server
+export HDB_BIN=/usr/local/bin/hammerdb
+export HDB_WORKLOAD_TCL=/home/nutanix/output/hammerdb
+export XRAY_PG_DB_NAME=vglb8diskdb
+export XRAY_PG_DB_TS=vglb8disk_ts
+export XRAY_PG_MAIN_DIR=/mnt/pgdata/data
+export XRAY_PG_WAL_LINK=$XRAY_PG_MAIN_DIR/pg_wal
