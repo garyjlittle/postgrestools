@@ -1,0 +1,1 @@
+ssh nutanix@perf105-xray-postgres-server "psql -U postgres -d postgres -c \"SELECT pid, datname, usename, application_name, client_addr, state, LEFT(query, 100) as query_preview, backend_start, query_start FROM pg_stat_activity WHERE state != 'idle' ORDER BY query_start;\"" 2>&1
