@@ -182,6 +182,66 @@ for d in /var/lib/pgsql/data /var/lib/postgresql /mnt/pgdata/data /pgdata/data; 
     [ -d "$d" ] && echo "datadir_found=$d"
 done
 
+# --- cgroup resource policies for the postgres service ---
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    echo "cg_version=2"
+elif [ -d /sys/fs/cgroup ]; then
+    echo "cg_version=1"
+fi
+# cgroup membership of the postmaster
+if [ -n "$first" ]; then
+    cgpath=$(sed -n 's/^0:://p' /proc/$first/cgroup 2>/dev/null)
+    [ -z "$cgpath" ] && cgpath=$(awk -F: '$2=="cpu,memory" || $2=="memory" {print $3; exit}' /proc/$first/cgroup 2>/dev/null)
+    [ -n "$cgpath" ] && echo "cg_path=$cgpath"
+fi
+# systemd resource-control properties (works for v1 and v2)
+if command -v systemctl >/dev/null 2>&1; then
+    svc=$(systemctl list-units -t service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^postgresql(@|\.)' | head -1)
+    [ -z "$svc" ] && svc=$(systemctl list-units -t service --no-legend 2>/dev/null | awk '{print $1}' | grep -i postgres | head -1)
+    if [ -n "$svc" ]; then
+        echo "cg_service=$svc"
+        systemctl show "$svc" -p ControlGroup,CPUAccounting,MemoryAccounting,IOAccounting,TasksAccounting,CPUWeight,CPUQuota,CPUQuotaPerSecUSec,MemoryMax,MemoryHigh,MemoryLow,MemoryLimit,MemorySwapMax,IOWeight,IOReadBandwidthMax,IOWriteBandwidthMax,TasksMax,LimitNOFILE,LimitNPROC 2>/dev/null | while IFS='=' read -r k v; do
+            # skip empty / unset markers to keep the report clean
+            case "$v" in ""|"[not set]") continue ;; esac
+            echo "cg.$k=$v"
+        done
+    fi
+fi
+# effective v2 limits straight from sysfs (catches values systemctl reports as infinity)
+if [ -n "$cgpath" ] && [ -d "/sys/fs/cgroup/$cgpath" ]; then
+    for f in cpu.max cpu.weight memory.max memory.high memory.low io.weight pids.max; do
+        [ -f "/sys/fs/cgroup/$cgpath/$f" ] && echo "cg.eff.$f=$(cat /sys/fs/cgroup/$cgpath/$f 2>/dev/null)"
+    done
+fi
+
+# --- live cgroup usage (v2) ---
+if [ -n "$cgpath" ] && [ -d "/sys/fs/cgroup/$cgpath" ]; then
+    CGD="/sys/fs/cgroup/$cgpath"
+    for f in memory.current memory.peak memory.swap.current pids.current; do
+        [ -f "$CGD/$f" ] && echo "cgu.$f=$(cat $CGD/$f 2>/dev/null)"
+    done
+    # cpu.stat -> usage_usec / user_usec / system_usec
+    if [ -f "$CGD/cpu.stat" ]; then
+        while read -r k v; do
+            case "$k" in usage_usec|user_usec|system_usec)
+                echo "cgu.cpu.$k=$v" ;;
+            esac
+        done < "$CGD/cpu.stat"
+    fi
+    # io.stat -> sum rbytes/wbytes across devices
+    if [ -f "$CGD/io.stat" ]; then
+        awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="rbytes")r+=a[2]; if(a[1]=="wbytes")w+=a[2]; if(a[1]=="rios")ri+=a[2]; if(a[1]=="wios")wi+=a[2]}} END{print "cgu.io.rbytes=" r; print "cgu.io.wbytes=" w; print "cgu.io.rios=" ri; print "cgu.io.wios=" wi}' "$CGD/io.stat" 2>/dev/null
+    fi
+    # memory.events -> oom / oom_kill / max / high
+    if [ -f "$CGD/memory.events" ]; then
+        while read -r k v; do
+            case "$k" in max|high|oom|oom_kill)
+                echo "cgu.memevents.$k=$v" ;;
+            esac
+        done < "$CGD/memory.events"
+    fi
+fi
+
 exit 0
 """
 
@@ -1029,6 +1089,25 @@ def build_report(args) -> Dict:
     report["listening_ports"] = listening or None
     report["psql_available_locally"] = bool(shutil.which("psql"))
 
+    # ── cgroup resource policies ─────────────────────────
+    cgroup: Dict[str, str] = {}
+    cg_usage: Dict[str, str] = {}
+    for k, vals in ssh.vars.items():
+        if k == "cg_version":
+            cgroup["version"] = vals[0]
+        elif k == "cg_path":
+            cgroup["path"] = vals[0]
+        elif k == "cg_service":
+            cgroup["service"] = vals[0]
+        elif k.startswith("cg."):
+            cgroup[k[3:]] = vals[0]
+        elif k.startswith("cgu."):
+            cg_usage[k[4:]] = vals[0]
+    if cgroup:
+        report["cgroup"] = cgroup
+    if cg_usage:
+        report["cgroup_usage"] = cg_usage
+
     # ── verdict + exit code ─────────────────────────────────
     if installed and running:
         verdict, code = "INSTALLED AND RUNNING", 0
@@ -1115,6 +1194,80 @@ def print_report(rep: Dict, args) -> None:
         ("Answers startup", tick(net.get("responding"))),
         ("Probe detail", net.get("detail") or "-"),
     ])
+
+    # ── cgroup resource policies ─────────────────────────
+    cg = rep.get("cgroup")
+    if cg:
+        print()
+        print(c(Colors.BOLD, "  Cgroup resource policies"))
+        rows = []
+        if cg.get("version"):
+            rows.append(("Cgroup version", f"v{cg['version']}"))
+        if cg.get("service"):
+            rows.append(("Service", cg["service"]))
+        if cg.get("path"):
+            rows.append(("Cgroup path", cg["path"]))
+        # Friendly ordering of the resource limits people care about.
+        label_map = [
+            ("CPUQuota", "CPU quota"), ("eff.cpu.max", "CPU max (effective)"),
+            ("CPUWeight", "CPU weight"), ("eff.cpu.weight", "CPU weight (effective)"),
+            ("MemoryMax", "Memory max"), ("eff.memory.max", "Memory max (effective)"),
+            ("MemoryHigh", "Memory high"), ("eff.memory.high", "Memory high (effective)"),
+            ("MemoryLow", "Memory low"), ("MemoryLimit", "Memory limit (v1)"),
+            ("MemorySwapMax", "Swap max"),
+            ("IOWeight", "IO weight"), ("eff.io.weight", "IO weight (effective)"),
+            ("IOReadBandwidthMax", "IO read max"), ("IOWriteBandwidthMax", "IO write max"),
+            ("TasksMax", "Tasks max"), ("eff.pids.max", "PIDs max (effective)"),
+            ("LimitNOFILE", "Limit NOFILE"), ("LimitNPROC", "Limit NPROC"),
+            ("CPUAccounting", "CPU accounting"), ("MemoryAccounting", "Memory accounting"),
+            ("IOAccounting", "IO accounting"), ("TasksAccounting", "Tasks accounting"),
+        ]
+        shown = set()
+        for key, label in label_map:
+            if key in cg:
+                rows.append((label, cg[key]))
+                shown.add(key)
+        # any remaining cg.* properties not in the map
+        for key in sorted(cg):
+            if key in ("version", "service", "path") or key in shown:
+                continue
+            rows.append((key, cg[key]))
+        print_kv_rows(rows)
+
+    # ── live cgroup usage ────────────────────────────────
+    cgu = rep.get("cgroup_usage")
+    if cgu:
+        print()
+        print(c(Colors.BOLD, "  Cgroup live usage"))
+        rows = []
+        if "memory.current" in cgu:
+            rows.append(("Memory current", _human_bytes(cgu["memory.current"])))
+        if "memory.peak" in cgu:
+            rows.append(("Memory peak", _human_bytes(cgu["memory.peak"])))
+        if "memory.swap.current" in cgu:
+            rows.append(("Swap current", _human_bytes(cgu["memory.swap.current"])))
+        if "cpu.usage_usec" in cgu:
+            rows.append(("CPU usage (total)", _human_usec(cgu["cpu.usage_usec"])))
+        if "cpu.user_usec" in cgu:
+            rows.append(("CPU user", _human_usec(cgu["cpu.user_usec"])))
+        if "cpu.system_usec" in cgu:
+            rows.append(("CPU system", _human_usec(cgu["cpu.system_usec"])))
+        if "pids.current" in cgu:
+            rows.append(("PIDs current", cgu["pids.current"]))
+        if "io.rbytes" in cgu:
+            rows.append(("IO read", _human_bytes(cgu["io.rbytes"])))
+        if "io.wbytes" in cgu:
+            rows.append(("IO write", _human_bytes(cgu["io.wbytes"])))
+        if "io.rios" in cgu:
+            rows.append(("IO read ops", cgu["io.rios"]))
+        if "io.wios" in cgu:
+            rows.append(("IO write ops", cgu["io.wios"]))
+        # OOM / throttle events are worth surfacing when non-zero
+        for ev in ("oom_kill", "oom", "max", "high"):
+            k = f"memevents.{ev}"
+            if k in cgu and cgu[k] not in ("0", ""):
+                rows.append((f"mem.events {ev}", c(Colors.RED, cgu[k])))
+        print_kv_rows(rows)
 
     if rep.get("psql"):
         print()
@@ -1221,6 +1374,35 @@ def build_hints(rep: Dict) -> List[str]:
         hints.append("List databases: re-run with --pg-password <pw> "
                      "(or --pg-user/-U as needed)")
     return hints
+
+
+def _human_bytes(n: str) -> str:
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if f < 1024 or unit == "TiB":
+            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return str(n)
+
+
+def _human_usec(n: str) -> str:
+    try:
+        us = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    secs = us / 1_000_000.0
+    if secs < 1:
+        return f"{us} µs"
+    if secs < 60:
+        return f"{secs:.2f} s"
+    mins, s = divmod(int(secs), 60)
+    if mins < 60:
+        return f"{mins}m {s}s"
+    hrs, m = divmod(mins, 60)
+    return f"{hrs}h {m}m"
 
 
 def print_kv_rows(rows: List[Tuple[str, str]]) -> None:
